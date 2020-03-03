@@ -1,0 +1,280 @@
+##################################
+# Create edx set, validation set #
+##################################
+
+# This is the default code provided through MovieLens preparation
+# Some additional changes were made to convert timestamps to just the year
+# Note: this process could take a couple of minutes
+
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+options(digits = 6)
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+#Convert timestamps to year only
+class(ratings$timestamp) <- c('POSIXt', 'POSIXct')
+ratings$timestamp <- format(ratings$timestamp, '%Y')
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding")
+# if using R 3.5 or earlier, use `set.seed(1)` instead
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+
+##################################################
+# Train and test formulas to generate RMSE score #
+##################################################
+
+#split edx dataset into training and testing sets for use in all models
+set.seed(1, sample.kind = "Rounding")
+test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.5, list = FALSE)
+train_set <- edx[-test_index,]
+test_set <- edx[test_index,]
+
+test_set <- test_set %>%
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId")
+mu_hat <- mean(edx$rating)
+
+edx %>% 
+  group_by(movieId) %>% 
+  summarize(mu = mean(rating)) %>% 
+  qplot(mu, geom="histogram",data = ., bins=10) + 
+  xlab("Rating") + 
+  ylab("Count") + 
+  ggtitle("Average Rating by Movie") +
+  theme_classic()
+
+naive_rmse <- RMSE(validation$rating, mu_hat)
+rmse_results <- data_frame(method = "Just the average", RMSE = naive_rmse)
+
+##################################################
+#Movie Effect Model
+rmses <- function(){
+  mu <- mean(edx$rating)
+  movie_avgs <- edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = mean(rating-mu))
+  predicted_ratings <- mu + validation %>%
+    left_join(movie_avgs, by = 'movieId') %>%
+    .$b_i
+  return(RMSE(predicted_ratings, validation$rating))
+}
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie Effect Model",  
+                                     RMSE = min(rmses())))
+
+##################################################
+#Movie + User Effect Model
+rmses <- function(){
+  mu <- mean(edx$rating)
+  movie_avgs <- edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = mean(rating-mu))
+  user_avgs <- edx %>%
+    left_join(movie_avgs, by='movieId') %>%
+    group_by(userId) %>%
+    summarize(b_u = mean(rating - mu - b_i))
+  predicted_ratings <- validation %>%
+    left_join(movie_avgs, by = 'movieId') %>%
+    left_join(user_avgs, by = 'userId') %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    .$pred
+  return(RMSE(predicted_ratings, validation$rating))
+}
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Movie + User Effect Model",  
+                                     RMSE = min(rmses())))
+
+##################################################
+#Regularized Movie Effect Model
+#train using edx split by test_index
+lambdas <- seq(0, 10, 0.25)
+
+rmses <- sapply(lambdas, function(l){
+  mu <- mean(train_set$rating)
+  b_i <- train_set %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  predicted_ratings <- test_set %>%
+    left_join(b_i, by = "movieId") %>%
+    mutate(pred = mu + b_i) %>%
+    .$pred
+  return(RMSE(predicted_ratings, test_set$rating))
+})
+
+lambda <- lambdas[which.min(rmses)]
+
+#test using edx and validation sets
+rmses <- sapply(lambda, function(l){
+  mu <- mean(edx$rating)
+  b_i <- edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  predicted_ratings <- validation %>%
+    left_join(b_i, by = "movieId") %>%
+    mutate(pred = mu + b_i) %>%
+    .$pred
+  return(RMSE(predicted_ratings, validation$rating))
+})
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Regularized Movie Effect Model",  
+                                     RMSE = min(rmses)))
+
+##################################################
+#Regularized Movie + User Effect Model
+#train using edx split by test_index
+lambdas <- seq(0, 10, 0.25)
+
+rmses <- sapply(lambdas, function(l){
+  mu <- mean(train_set$rating)
+  b_i <- train_set %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  b_u <- train_set %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  predicted_ratings <- test_set %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    .$pred
+  return(RMSE(predicted_ratings, test_set$rating))
+})
+
+lambda <- lambdas[which.min(rmses)]
+
+#test using edx and validation sets
+rmses <- sapply(lambda, function(l){
+  mu <- mean(edx$rating)
+  b_i <- edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  b_u <- edx %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  predicted_ratings <- validation %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    .$pred
+  return(RMSE(predicted_ratings, validation$rating))
+})
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Regularized Movie + User Effect Model",  
+                                     RMSE = min(rmses)))
+
+##################################################
+#Regularized Movie + User + Genre Effect Model
+#train using edx split by test_index
+lambdas <- seq(0, 10, 0.25)
+
+rmses <- sapply(lambdas, function(l){
+  mu <- mean(train_set$rating)
+  b_i <- train_set %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  b_u <- train_set %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  b_uu <- train_set %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(genres) %>%
+    summarize(b_uu = sum(rating - b_i - mu)/(n()+l))
+  predicted_ratings <- test_set %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    left_join(b_uu, by = "genres") %>%
+    mutate(pred = mu + b_i + b_u + b_uu) %>%
+    .$pred
+  return(RMSE(predicted_ratings, test_set$rating))
+})
+
+lambda <- lambdas[which.min(rmses)]
+
+#test using edx and validation sets
+rmses <- sapply(lambda, function(l){
+  mu <- mean(edx$rating)
+  b_i <- edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  b_u <- edx %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  b_uu <- edx %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(genres) %>%
+    summarize(b_uu = sum(rating - b_i - mu)/(n()+l))
+  predicted_ratings <- validation %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    left_join(b_uu, by = "genres") %>%
+    mutate(pred = mu + b_i + b_u + b_uu) %>%
+    .$pred
+  return(RMSE(predicted_ratings, validation$rating))
+})
+
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(method="Regularized Movie + User + Genre Effect Model",  
+                                     RMSE = min(rmses)))
+####################################################################################################
+# This is just a formula to reduce the number of significant digits in the RMSE tables
+new_rmse <- rmse_results
+new_rmse$RMSE <- format(new_rmse$RMSE, format = "f", digits=6)
+ggplot(data = new_rmse, aes(y = as.numeric(RMSE), x = method)) + 
+  geom_point(stat = "identity") + 
+  geom_text(aes(label = RMSE), vjust=-0.5)+
+  coord_flip() + 
+  ylim(limits = c(0.8,1.1)) +
+  geom_hline(yintercept = 1) + 
+  ylab("RMSE Score") +
+  xlab("Data Model Method") +
+  theme(axis.text.y = element_text(angle = 45, hjust = 1, size = 10)) + 
+  theme_classic()
+
+print("Table of RMSEs")
+rmse_results %>% knitr::kable()
+print(paste("The best model is the:", rmse_results$method[which.min(rmse_results$RMSE)]))
+top_score <- format(min(rmse_results$RMSE), format = "f", digits = 6)
+print(paste("It has an RMSE score of:", top_score))
